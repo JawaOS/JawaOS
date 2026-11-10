@@ -1,0 +1,209 @@
+name: Build ISO and publish pre-release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release-iso-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ISO (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        arch: [x86_64, aarch64, riscv64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld make xorriso
+
+      - name: Build ISO
+        run: make ARCH=${{ matrix.arch }} iso
+
+      - name: Stage boot kit (kernel + config + Limine UEFI binaries)
+        run: |
+          mkdir -p bootkit
+          cp build/${{ matrix.arch }}/jawaos.elf bootkit/
+          cp boot/limine.conf bootkit/
+          cp third_party/limine/BOOT*.EFI bootkit/
+          ls -l bootkit
+
+      - name: Upload ISO
+        uses: actions/upload-artifact@v4
+        with:
+          name: iso-${{ matrix.arch }}
+          path: build/${{ matrix.arch }}/jawaos-${{ matrix.arch }}.iso
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload boot kit
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootkit-${{ matrix.arch }}
+          path: bootkit/
+          if-no-files-found: error
+          retention-days: 1
+
+  smoke:
+    name: Boot smoke test (${{ matrix.arch }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            pkgs: qemu-system-x86
+          - arch: aarch64
+            pkgs: qemu-system-arm qemu-efi-aarch64
+          - arch: riscv64
+            pkgs: qemu-efi-riscv64
+    steps:
+      - name: Download ISO
+        uses: actions/download-artifact@v4
+        with:
+          name: iso-${{ matrix.arch }}
+          path: dist
+
+      - name: Download boot kit
+        if: matrix.arch != 'x86_64'
+        uses: actions/download-artifact@v4
+        with:
+          name: bootkit-${{ matrix.arch }}
+          path: bootkit
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.arch }}" = "riscv64" ]; then
+
+            sudo apt-get install -y qemu-system-riscv \
+              || sudo apt-get install -y qemu-system-misc
+            command -v qemu-system-riscv64
+          else
+            sudo apt-get install -y ${{ matrix.pkgs }}
+          fi
+
+      - name: Prepare firmware and boot disk
+        if: matrix.arch != 'x86_64'
+        run: |
+          sudo apt-get install -y mtools
+          case "${{ matrix.arch }}" in
+            aarch64)
+              FLASH=64M
+              cp /usr/share/qemu-efi-aarch64/QEMU_EFI.fd code.fd
+              EFI_NAME=BOOTAA64.EFI
+              ;;
+            riscv64)
+              FLASH=32M
+              cp /usr/share/qemu-efi-riscv64/RISCV_VIRT_CODE.fd code.fd
+              EFI_NAME=BOOTRISCV64.EFI
+              ;;
+          esac
+          truncate -s "$FLASH" code.fd
+          truncate -s "$FLASH" vars.fd
+          dd if=/dev/zero of=disk.img bs=1M count=64 status=none
+          mformat -i disk.img ::
+          mmd   -i disk.img ::/EFI ::/EFI/BOOT ::/boot ::/boot/limine
+          mcopy -i disk.img bootkit/jawaos.elf  ::/boot/jawaos.elf
+          mcopy -i disk.img bootkit/limine.conf ::/boot/limine/limine.conf
+          mcopy -i disk.img bootkit/$EFI_NAME   ::/EFI/BOOT/$EFI_NAME
+          mdir -i disk.img ::/ ::/EFI/BOOT ::/boot ::/boot/limine
+
+      - name: Boot and check self-tests
+        run: |
+          case "${{ matrix.arch }}" in
+            x86_64)
+              ARGS="-M q35 -m 256M -cdrom dist/jawaos-x86_64.iso -boot d"
+              ;;
+            aarch64)
+              ARGS="-M virt -cpu cortex-a72 -m 256M \
+                -drive if=pflash,format=raw,readonly=on,file=code.fd \
+                -drive if=pflash,format=raw,file=vars.fd \
+                -device ramfb \
+                -drive file=disk.img,if=none,format=raw,id=hd0 \
+                -device virtio-blk-pci,drive=hd0"
+              ;;
+            riscv64)
+              ARGS="-M virt -cpu rv64 -m 256M \
+                -drive if=pflash,format=raw,readonly=on,file=code.fd \
+                -drive if=pflash,format=raw,file=vars.fd \
+                -device ramfb \
+                -drive file=disk.img,if=none,format=raw,id=hd0 \
+                -device virtio-blk-pci,drive=hd0"
+              ;;
+          esac
+
+          timeout 120 qemu-system-${{ matrix.arch }} $ARGS \
+            -display none -serial file:boot.log \
+            -d int -D qint.log || true
+          echo "--- last 25 lines of serial output ---"
+          tail -25 boot.log
+          grep -q "memory management online" boot.log
+
+      - name: Upload serial log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-log-${{ matrix.arch }}
+          path: boot.log
+          retention-days: 3
+
+      - name: Upload QEMU interrupt trace
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: qint-log-${{ matrix.arch }}
+          path: qint.log
+          retention-days: 3
+
+  release:
+    name: Publish pre-release
+    needs: [build, smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Delete all previous releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate --jq '.[].tag_name' |
+          while read -r tag; do
+            echo "deleting release + tag: $tag"
+            gh release delete "$tag" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          done
+
+      - name: Download ISOs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: iso-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create checksums
+        working-directory: dist
+        run: sha256sum *.iso > SHA256SUMS
+
+      - name: Publish release (always a pre-release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="build-${{ github.run_number }}-${GITHUB_SHA::7}"
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "JawaOS $TAG" \
+            --notes "Automated build of \`${GITHUB_SHA::7}\` from \`${GITHUB_REF_NAME}\`." \
+            --prerelease
