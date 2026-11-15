@@ -116,6 +116,25 @@ static void arch_tlb_inval_page(uint64_t va)
 
 static const char *arch_paging_mode(void) { return "x86_64 4-level (CR3)"; }
 
+static unsigned arch_user_levels(void)
+{
+    return VMM_FIXED_LEVELS;
+}
+
+/* Low canonical half: bits 47:0, so user VAs are [0, 2^47). */
+static uint64_t arch_user_va_limit(void)
+{
+    return 1ull << 47;
+}
+
+static void arch_tlb_flush_local(void)
+{
+    /* Reload CR3 without changing it: full non-global TLB flush. */
+    uint64_t cr3;
+    __asm__ volatile ("mov %%cr3, %0\n\tmov %0, %%cr3"
+                      : "=r"(cr3) : : "memory");
+}
+
 #elif defined(__aarch64__)
 
 #define VMM_FIXED_LEVELS 4
@@ -241,6 +260,54 @@ static const char *arch_paging_mode(void)
     return "aarch64 4 KiB granule, 4-level (TTBR1_EL1)";
 }
 
+/* The user half of the EL1&0 regime is driven by TTBR0_EL1, whose VA
+ * width is TCR_EL1.T0SZ — read it once and derive the walk depth
+ * (4 KiB granule: top level index covers va_bits-12-9*(n-1) bits). */
+static unsigned a64_user_levels;
+static uint64_t a64_user_va_limit;
+
+static void a64_user_tcr_setup(void)
+{
+    uint64_t tcr;
+    __asm__ volatile ("mrs %0, tcr_el1" : "=r"(tcr));
+
+    unsigned t0sz = (unsigned)(tcr & 0x3Full);
+    unsigned va_bits = 64 - t0sz;
+
+    if (va_bits < 33 || va_bits > 48)
+        panic("vmm: TCR_EL1.T0SZ=%u gives %u-bit user VA, "
+              "only 33..48 supported", t0sz, va_bits);
+
+    a64_user_levels = (va_bits - 12 + 8) / 9;
+    a64_user_va_limit = 1ull << va_bits;
+
+    /* Limine may leave EPD0 set (TTBR0 walks disabled). The user half
+     * of the regime must walk, so clear EPD0 and keep everything else
+     * (T0SZ, attributes) as the bootloader programmed it. */
+    tcr &= ~(1ull << 7);
+    __asm__ volatile ("msr tcr_el1, %0\n\tdsb sy\n\tisb"
+                      : : "r"(tcr) : "memory");
+}
+
+static unsigned arch_user_levels(void)
+{
+    return a64_user_levels;
+}
+
+static uint64_t arch_user_va_limit(void)
+{
+    return a64_user_va_limit;
+}
+
+static void arch_tlb_flush_local(void)
+{
+    __asm__ volatile ("dsb ishst\n"
+                      "tlbi vmalle1\n"
+                      "dsb sy\n"
+                      "isb"
+                      : : : "memory");
+}
+
 #elif defined(__riscv)
 
 #define RV_V (1ull << 0)
@@ -353,6 +420,23 @@ static const char *arch_paging_mode(void)
     }
 }
 
+/* Same single root serves the low (user) and high (kernel) halves;
+ * the user half is root indexes 0..255 = [0, 2^(12+9*(n-1))*256). */
+static unsigned arch_user_levels(void)
+{
+    return vmm_levels;
+}
+
+static uint64_t arch_user_va_limit(void)
+{
+    return 256ull << (PAGE_SHIFT + 9 * (vmm_levels - 1));
+}
+
+static void arch_tlb_flush_local(void)
+{
+    __asm__ volatile ("sfence.vma zero, zero" : : : "memory");
+}
+
 #else
 #error "unsupported architecture for the VMM"
 #endif
@@ -379,12 +463,13 @@ static inline uint64_t level_leaf_size(unsigned level)
     return 1ull << (PAGE_SHIFT + 9 * (level - 1));
 }
 
-static uint64_t *pt_walk(uint64_t va, unsigned target_level, bool create,
-                         unsigned *out_level)
+static uint64_t *pt_walk_at(uint64_t *root, uint64_t va, unsigned nlevels,
+                            unsigned target_level, bool create,
+                            unsigned *out_level, bool count)
 {
-    uint64_t *table = vmm_root;
+    uint64_t *table = root;
 
-    for (unsigned level = levels(); ; level--) {
+    for (unsigned level = nlevels; ; level--) {
         uint64_t *slot = &table[pt_index(va, level)];
 
         if (level == target_level) {
@@ -402,7 +487,8 @@ static uint64_t *pt_walk(uint64_t va, unsigned target_level, bool create,
             if (newtab == 0)
                 panic("vmm: PMM exhausted while building page tables");
             memset((void *)boot_phys_to_virt(newtab), 0, PAGE_SIZE);
-            table_pages++;
+            if (count)
+                table_pages++;
             *slot = pte_table(newtab);
             e = *slot;
         } else if (pte_is_leaf(e, level)) {
@@ -412,6 +498,13 @@ static uint64_t *pt_walk(uint64_t va, unsigned target_level, bool create,
 
         table = (uint64_t *)boot_phys_to_virt(pte_table_paddr(e));
     }
+}
+
+static uint64_t *pt_walk(uint64_t va, unsigned target_level, bool create,
+                         unsigned *out_level)
+{
+    return pt_walk_at(vmm_root, va, levels(), target_level, create,
+                      out_level, true);
 }
 
 static void map_range(uint64_t vaddr, uint64_t paddr, uint64_t size,
@@ -539,6 +632,119 @@ uint64_t vmm_table_pages(void)  { return table_pages; }
 
 const char *vmm_paging_mode_name(void) { return arch_paging_mode(); }
 
+unsigned vmm_levels_count(void) { return levels(); }
+
+unsigned vmm_user_levels(void) { return arch_user_levels(); }
+
+uint64_t vmm_kernel_root(void) { return vmm_root_pa; }
+
+uint64_t vmm_user_va_limit(void) { return arch_user_va_limit(); }
+
+uint64_t *vmm_pte_slot(uint64_t root_pa, uint64_t va, bool create,
+                       unsigned *out_level)
+{
+    if (!page_aligned(va))
+        panic("vmm: vmm_pte_slot of misaligned VA 0x%llx",
+              (unsigned long long)va);
+
+    uint64_t *root = (uint64_t *)boot_phys_to_virt(root_pa);
+    return pt_walk_at(root, va, arch_user_levels(), 1, create,
+                      out_level, false);
+}
+
+bool vmm_pte_present(uint64_t e) { return pte_present(e) != 0; }
+
+bool vmm_pte_is_leaf(uint64_t e, unsigned level)
+{
+    return pte_is_leaf(e, level);
+}
+
+uint64_t vmm_pte_paddr(uint64_t e) { return pte_table_paddr(e); }
+
+unsigned vmm_pte_flags(uint64_t e) { return pte_flags(e); }
+
+void vmm_pte_write_leaf(uint64_t *slot, uint64_t paddr, unsigned flags)
+{
+    if (!page_aligned(paddr))
+        panic("vmm: vmm_pte_write_leaf of misaligned phys 0x%llx",
+              (unsigned long long)paddr);
+    if ((flags & (VM_PROT_WRITE | VM_PROT_EXEC)) ==
+        (VM_PROT_WRITE | VM_PROT_EXEC))
+        panic("vmm: W^X violation — refusing leaf PTE write+exec");
+    if ((flags & (VM_PROT_DEVICE | VM_PROT_EXEC)) ==
+        (VM_PROT_DEVICE | VM_PROT_EXEC))
+        panic("vmm: refusing leaf PTE device+exec");
+    if (!(flags & VM_PROT_READ))
+        panic("vmm: vmm_pte_write_leaf without VM_PROT_READ");
+
+    *slot = pte_leaf(paddr, flags);
+}
+
+void vmm_pte_clear(uint64_t *slot)
+{
+    *slot = 0;
+}
+
+void vmm_tlb_inval(uint64_t va)
+{
+    arch_tlb_inval_page(va);
+}
+
+void vmm_tlb_flush_local(void)
+{
+    arch_tlb_flush_local();
+}
+
+void vmm_copy_kernel_half(uint64_t dst_root_pa)
+{
+#if defined(__aarch64__)
+    /* The kernel half lives in TTBR1_EL1; a TTBR0 user root starts
+     * completely empty. */
+    (void)dst_root_pa;
+#else
+    /* x86_64 and riscv64 share one root: the higher half is kernel
+     * (root indexes 256..511), the lower half user (0..255). Every
+     * process root shares the kernel entries. */
+    uint64_t *dst = (uint64_t *)boot_phys_to_virt(dst_root_pa);
+    for (unsigned i = 256; i < 512; i++)
+        dst[i] = vmm_root[i];
+#endif
+}
+
+static void vmm_free_tables_below(uint64_t *table, unsigned level,
+                                  unsigned count)
+{
+    for (unsigned i = 0; i < count; i++) {
+        uint64_t e = table[i];
+        if (!pte_present(e) || pte_is_leaf(e, level))
+            continue;
+        if (level == 1)
+            panic("vmm: non-leaf PTE at leaf level (corrupt root)");
+        uint64_t next_pa = pte_table_paddr(e);
+        vmm_free_tables_below((uint64_t *)boot_phys_to_virt(next_pa),
+                              level - 1, 512);
+        pmm_free(next_pa);
+    }
+}
+
+void vmm_free_user_tables(uint64_t root_pa)
+{
+    if (!page_aligned(root_pa) || root_pa == vmm_root_pa)
+        panic("vmm: vmm_free_user_tables of the kernel root");
+
+#if defined(__aarch64__)
+    /* TTBR0 root: the whole table is user space. */
+    unsigned count = 512;
+#else
+    /* Shared root: indexes 256..511 are the kernel half and must
+     * never be touched (the kernel's tables live behind them). */
+    unsigned count = 256;
+#endif
+    vmm_free_tables_below((uint64_t *)boot_phys_to_virt(root_pa),
+                          arch_user_levels(), count);
+    pmm_free(root_pa);
+}
+
 static uint64_t device_next = VMM_DEVICE_BASE;
 static spinlock_t device_lock = SPINLOCK_INIT;
 
@@ -582,6 +788,10 @@ void vmm_init(void)
     arch_levels();
 #else
     vmm_levels = arch_levels();
+#endif
+
+#if defined(__aarch64__)
+    a64_user_tcr_setup();
 #endif
 
     vmm_root_pa = arch_root_alloc();
