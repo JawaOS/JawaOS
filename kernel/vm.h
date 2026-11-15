@@ -52,4 +52,28 @@ bool vm_munmap(vm_as_t *as, uint64_t addr, uint64_t len);
 /* Number of resident (mapped) pages owned by the address space. */
 uint64_t vm_as_resident_pages(vm_as_t *as);
 
+/* ---- page faults ---- */
+
+/* What the most recent page fault looked like (set on every fault the
+ * trap layer sees, resolved or not). */
+struct vm_fault_info {
+    bool valid;
+    bool write;
+    bool exec;
+    bool guard;     /* faulted inside a VM_VMA_GUARD region */
+    uint64_t va;
+};
+
+extern struct vm_fault_info vm_last_fault;
+
+/* Classify a fault against the current address space. Always records
+ * vm_last_fault; never resolves anything. */
+void vm_fault_record(uint64_t va, bool write, bool exec);
+
+/* Try to recover a page fault in the current address space by mapping
+ * the page on demand (anonymous zero-fill). Returns false when the
+ * fault is not recoverable: no VMA, permission violation, guard page,
+ * already-resident mapping, or out of memory. */
+bool vm_handle_fault(uint64_t va, bool write, bool exec);
+
 #endif

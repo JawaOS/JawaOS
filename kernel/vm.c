@@ -135,7 +135,9 @@ static uint64_t vm_map_page(struct vm_as *as, uint64_t va, unsigned flags)
     memset((void *)boot_phys_to_virt(frame), 0, PAGE_SIZE);
 
     unsigned level;
-    uint64_t *slot = vmm_pte_slot(as->root_pa, va, true, &level);
+    unsigned created = 0;
+    uint64_t *slot = vmm_pte_slot(as->root_pa, va, true, &level, &created);
+    as->table_pages += created;
     if (level != 1) {
         pmm_free(frame);
         return 0;
@@ -154,7 +156,7 @@ static uint64_t vm_map_page(struct vm_as *as, uint64_t va, unsigned flags)
 static bool vm_unmap_page(struct vm_as *as, uint64_t va)
 {
     unsigned level;
-    uint64_t *slot = vmm_pte_slot(as->root_pa, va, false, &level);
+    uint64_t *slot = vmm_pte_slot(as->root_pa, va, false, &level, NULL);
     if (slot == NULL || level != 1 || !vmm_pte_present(*slot))
         return false;
 
@@ -355,6 +357,64 @@ static void arch_set_root(uint64_t root_pa)
 #else
 #error "unsupported architecture for vm"
 #endif
+
+/* ---- page faults: demand paging and recovery ---- */
+
+struct vm_fault_info vm_last_fault;
+
+static bool vma_access_ok(struct vm_vma *v, bool write, bool exec)
+{
+    if (v->flags & VM_VMA_GUARD)
+        return false;
+    if (write && !(v->flags & VM_PROT_WRITE))
+        return false;
+    if (exec && !(v->flags & VM_PROT_EXEC))
+        return false;
+    return true;
+}
+
+void vm_fault_record(uint64_t va, bool write, bool exec)
+{
+    vm_last_fault.valid = true;
+    vm_last_fault.va = va;
+    vm_last_fault.write = write;
+    vm_last_fault.exec = exec;
+
+    vm_as_t *as = vm_as_current();
+    struct vm_vma *v = as ? vma_find(as, page_align_down(va)) : NULL;
+    vm_last_fault.guard = v != NULL && (v->flags & VM_VMA_GUARD) != 0;
+}
+
+bool vm_handle_fault(uint64_t va, bool write, bool exec)
+{
+    vm_as_t *as = vm_as_current();
+    if (as == NULL)
+        return false;
+    va = page_align_down(va);
+
+    spin_lock(&as->lock);
+
+    struct vm_vma *v = vma_find(as, va);
+    if (v == NULL || !vma_access_ok(v, write, exec)) {
+        spin_unlock(&as->lock);
+        return false;
+    }
+
+    /* A resident page faulting again is a genuine permission violation,
+     * not something demand paging can fix. */
+    unsigned level;
+    uint64_t *slot = vmm_pte_slot(as->root_pa, va, false, &level, NULL);
+    if (slot != NULL && level == 1 && vmm_pte_present(*slot)) {
+        spin_unlock(&as->lock);
+        return false;
+    }
+
+    /* Anonymous demand-zero fill. */
+    uint64_t frame = vm_map_page(as, va, v->flags);
+
+    spin_unlock(&as->lock);
+    return frame != 0;      /* PMM empty: unrecoverable for the caller */
+}
 
 void vm_as_activate(vm_as_t *as)
 {

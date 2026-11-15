@@ -56,12 +56,14 @@ uint64_t vmm_kernel_root(void);
 uint64_t vmm_user_va_limit(void);
 
 /* Walk root_pa for va down to the level-1 slot. With create=true the full
- * path is materialised (level-1 slot always returned). With create=false
- * the walk stops at the first non-present entry: the returned slot is the
- * one where it stopped and *out_level is its level (caller must check
- * presence/leafness). A huge page in the path returns that slot/level. */
+ * path is materialised (level-1 slot always returned; *out_created, when
+ * non-NULL, counts the table pages allocated on this walk). With
+ * create=false the walk stops at the first non-present entry: the
+ * returned slot is the one where it stopped and *out_level is its level
+ * (caller must check presence/leafness). A huge page in the path returns
+ * that slot/level. */
 uint64_t *vmm_pte_slot(uint64_t root_pa, uint64_t va, bool create,
-                       unsigned *out_level);
+                       unsigned *out_level, unsigned *out_created);
 
 bool vmm_pte_present(uint64_t e);
 

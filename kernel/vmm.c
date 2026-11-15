@@ -465,7 +465,8 @@ static inline uint64_t level_leaf_size(unsigned level)
 
 static uint64_t *pt_walk_at(uint64_t *root, uint64_t va, unsigned nlevels,
                             unsigned target_level, bool create,
-                            unsigned *out_level, bool count)
+                            unsigned *out_level, bool count,
+                            unsigned *created)
 {
     uint64_t *table = root;
 
@@ -489,6 +490,8 @@ static uint64_t *pt_walk_at(uint64_t *root, uint64_t va, unsigned nlevels,
             memset((void *)boot_phys_to_virt(newtab), 0, PAGE_SIZE);
             if (count)
                 table_pages++;
+            if (created)
+                (*created)++;
             *slot = pte_table(newtab);
             e = *slot;
         } else if (pte_is_leaf(e, level)) {
@@ -504,7 +507,7 @@ static uint64_t *pt_walk(uint64_t va, unsigned target_level, bool create,
                          unsigned *out_level)
 {
     return pt_walk_at(vmm_root, va, levels(), target_level, create,
-                      out_level, true);
+                      out_level, true, NULL);
 }
 
 static void map_range(uint64_t vaddr, uint64_t paddr, uint64_t size,
@@ -641,15 +644,17 @@ uint64_t vmm_kernel_root(void) { return vmm_root_pa; }
 uint64_t vmm_user_va_limit(void) { return arch_user_va_limit(); }
 
 uint64_t *vmm_pte_slot(uint64_t root_pa, uint64_t va, bool create,
-                       unsigned *out_level)
+                       unsigned *out_level, unsigned *out_created)
 {
     if (!page_aligned(va))
         panic("vmm: vmm_pte_slot of misaligned VA 0x%llx",
               (unsigned long long)va);
+    if (out_created)
+        *out_created = 0;
 
     uint64_t *root = (uint64_t *)boot_phys_to_virt(root_pa);
     return pt_walk_at(root, va, arch_user_levels(), 1, create,
-                      out_level, false);
+                      out_level, false, out_created);
 }
 
 bool vmm_pte_present(uint64_t e) { return pte_present(e) != 0; }

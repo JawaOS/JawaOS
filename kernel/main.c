@@ -477,11 +477,11 @@ static void selftest_vm_vma(void)
           "anonymous mmap lands page-aligned above VM_USER_BASE");
 
     unsigned level;
-    uint64_t *slot = vmm_pte_slot(vm_as_root(as), va, false, &level);
+    uint64_t *slot = vmm_pte_slot(vm_as_root(as), va, false, &level, NULL);
     CHECK(slot != NULL && level == 1 && vmm_pte_present(*slot) &&
           (vmm_pte_flags(*slot) & VM_PROT_WRITE),
           "POPULATE maps the first page eagerly, read-write");
-    slot = vmm_pte_slot(vm_as_root(as), va + 2 * PAGE_SIZE, false, &level);
+    slot = vmm_pte_slot(vm_as_root(as), va + 2 * PAGE_SIZE, false, &level, NULL);
     CHECK(slot != NULL && level == 1 && vmm_pte_present(*slot),
           "POPULATE maps the whole range");
     CHECK(vm_as_resident_pages(as) == 3,
@@ -517,7 +517,7 @@ static void selftest_vm_vma(void)
           "munmap of the middle page");
     CHECK(vm_as_resident_pages(as) == 2,
           "resident count drops to 2");
-    slot = vmm_pte_slot(vm_as_root(as), va + PAGE_SIZE, false, &level);
+    slot = vmm_pte_slot(vm_as_root(as), va + PAGE_SIZE, false, &level, NULL);
     CHECK(slot == NULL || level != 1 || !vmm_pte_present(*slot),
           "middle page PTE cleared by munmap");
 
@@ -545,6 +545,58 @@ static void selftest_vm_vma(void)
     vm_as_destroy(as);
 }
 
+static void selftest_vm_demand(void)
+{
+    kprintf("selftest: demand paging and fault recovery\n");
+
+    vm_as_t *as = vm_as_create();
+    CHECK(as != NULL, "address space for demand paging");
+
+    /* Lazy by default: registered, but nothing resident. */
+    uint64_t va = vm_mmap(as, 0, 4 * PAGE_SIZE,
+                          VM_PROT_READ | VM_PROT_WRITE, VM_VMA_ANON);
+    CHECK(va != 0 && vm_as_resident_pages(as) == 0,
+          "lazy mmap is registered but maps nothing");
+
+    unsigned level;
+    uint64_t *slot = vmm_pte_slot(vm_as_root(as), va, false, &level, NULL);
+    CHECK(slot == NULL || level != 1 || !vmm_pte_present(*slot),
+          "no PTE present before the first access");
+
+    current->as = as;
+    vm_as_activate(as);
+    volatile uint64_t *p = (volatile uint64_t *)va;
+
+    uint64_t before = pmm_free_pages();
+    uint64_t tp_before = vm_as_table_pages(as);
+    p[0] = 0xC0DE5EEDull;                    /* write fault -> fill */
+    CHECK(p[0] == 0xC0DE5EEDull,
+          "write fault recovered by mapping a zeroed frame");
+    CHECK(p[1] == 0,
+          "demand-filled pages start zeroed");
+    CHECK(vm_as_resident_pages(as) == 1 &&
+          pmm_free_pages() == before - 1 -
+              (vm_as_table_pages(as) - tp_before),
+          "fault allocated exactly one data frame plus its page tables");
+
+    CHECK(p[PAGE_SIZE / 8] == 0,             /* read fault fills page 1 */
+          "read fault on the next page demand-fills and reads 0");
+    CHECK(vm_as_resident_pages(as) == 2,
+          "second page became resident through a read fault");
+
+    /* Unrecoverable faults must stay unrecoverable. */
+    CHECK(fault_probe(va + 10 * PAGE_SIZE) == false,
+          "fault outside any VMA is not recovered");
+    CHECK(!vm_last_fault.guard && !vm_last_fault.write,
+          "trap layer classified the out-of-VMA fault (read, no guard)");
+
+    current->as = NULL;
+    vm_as_activate(NULL);
+
+    CHECK(vm_munmap(as, va, 4 * PAGE_SIZE), "cleanup munmap");
+    vm_as_destroy(as);
+}
+
 static void kmain_cont(void)
 {
     vmm_init();
@@ -568,6 +620,7 @@ static void kmain_cont(void)
     selftest_thread();
     selftest_vm_as();
     selftest_vm_vma();
+    selftest_vm_demand();
 
     kprintf("\nmemory management online — idling.\n");
 

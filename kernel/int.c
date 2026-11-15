@@ -3,6 +3,7 @@
 #include "console.h"
 #include "int.h"
 #include "timer.h"
+#include "vm.h"
 
 static volatile uint64_t brk_count;
 static bool probe_armed;
@@ -114,6 +115,14 @@ static void isr_dispatch(struct tf_x86 *tf)
     if (tf->vector == 3) {
         brk_count++;
         return;
+    }
+    if (tf->vector == 14) {
+        /* Page fault: record it, then try demand-page recovery. */
+        bool write = (tf->error & 2) != 0;
+        bool exec = (tf->error & 16) != 0;
+        vm_fault_record(read_cr2(), write, exec);
+        if (!probe_armed && vm_handle_fault(read_cr2(), write, exec))
+            return;     /* recovered: re-execute the faulting insn */
     }
     if (probe_armed && tf->vector == 14) {
         tf->rax = 1;
@@ -516,6 +525,7 @@ static void exc_dispatch(struct tf_a64 *tf)
     tf->meta[3] = spsr;
 
     uint64_t ec = ESR_EC(esr);
+    bool abort_ec = ec == 0x20 || ec == 0x21 || ec == 0x24 || ec == 0x25;
 
     if (esr == 0) {
         // IRQ/FIQ have a zero ESR; interrupts stay masked for now, so this
@@ -525,8 +535,15 @@ static void exc_dispatch(struct tf_a64 *tf)
         if (ec == 0x3c)
             tf->meta[2] = elr + 4;   /* BRK: ELR points AT the instruction;
                                         SVC: ELR already points past it */
-    } else if (probe_armed &&
-               (ec == 0x20 || ec == 0x21 || ec == 0x24 || ec == 0x25)) {
+    } else if (abort_ec) {
+        /* Aborts: record, then try demand-page recovery. Data aborts
+         * carry WnR in ESR bit 6; EC 0x20/0x21 are instruction aborts. */
+        bool write = (ec == 0x24 || ec == 0x25) && (esr & (1 << 6)) != 0;
+        bool exec = ec == 0x20 || ec == 0x21;
+        vm_fault_record(far, write, exec);
+        if (!probe_armed && vm_handle_fault(far, write, exec))
+            return;     /* recovered: ELR already retries the instruction */
+    } else if (probe_armed && abort_ec) {
         tf->x0 = 1;
         tf->meta[2] = (uint64_t)probe_fail_leaf;
     } else {
@@ -735,6 +752,15 @@ static void trap_dispatch(struct tf_rv *tf)
         brk_count++;
         tf->sepc += 4;
         return;
+    }
+    if (scause == 12 || scause == 13 || scause == 15) {
+        /* Page faults: record, then try demand-page recovery.
+         * 12 = instruction, 13 = load, 15 = store. */
+        bool write = scause == 15;
+        bool exec = scause == 12;
+        vm_fault_record(tf->stval, write, exec);
+        if (!probe_armed && vm_handle_fault(tf->stval, write, exec))
+            return;     /* recovered: sepc retries the instruction */
     }
     if (probe_armed &&
         (scause == 4 || scause == 5 || scause == 6 || scause == 7 ||
