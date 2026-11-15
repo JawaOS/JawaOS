@@ -7,11 +7,21 @@
 /* Process-level virtual memory on top of the raw VMM.
  *
  * A vm_as owns one user root table (lower VA half only — the higher half
- * is shared kernel space). Kernel threads run with as == NULL and keep
- * the kernel root installed.
+ * is shared kernel space) and, later, the VMA list that describes it.
+ * Kernel threads run with as == NULL and keep the kernel root installed.
  */
 
 typedef struct vm_as vm_as_t;
+
+/* VMA / mmap flags (OR-ed with VM_PROT_* permissions). */
+#define VM_VMA_ANON     0x100u  /* anonymous demand-zero memory        */
+#define VM_VMA_GUARD    0x200u  /* guard: any access is a fatal fault  */
+#define VM_MAP_POPULATE 0x400u  /* map every page eagerly at mmap time */
+#define VM_MAP_FIXED    0x800u  /* hint is mandatory, not preferred    */
+
+/* Lower bound for anonymous mappings: the first 16 MiB of the user half
+ * stay unmapped so NULL and near-NULL dereferences always fault. */
+#define VM_USER_BASE 0x0000000001000000ull
 
 void vm_init(void);
 
@@ -27,5 +37,19 @@ vm_as_t *vm_as_current(void);
 uint64_t vm_as_root(vm_as_t *as);
 
 uint64_t vm_as_table_pages(vm_as_t *as);
+
+/* Create a memory-mapped region. hint==0: first-fit placement above
+ * VM_USER_BASE. hint!=0: preferred base (mandatory with VM_MAP_FIXED).
+ * Returns the region base or 0 on failure. Without VM_MAP_POPULATE the
+ * region is only registered — pages materialise on demand. */
+uint64_t vm_mmap(vm_as_t *as, uint64_t hint, uint64_t len,
+                 unsigned prot, unsigned vflags);
+
+/* Unmap [addr, addr+len), freeing resident pages. Holes inside the
+ * range are fine; returns false if nothing overlapped. */
+bool vm_munmap(vm_as_t *as, uint64_t addr, uint64_t len);
+
+/* Number of resident (mapped) pages owned by the address space. */
+uint64_t vm_as_resident_pages(vm_as_t *as);
 
 #endif

@@ -462,6 +462,89 @@ static void selftest_vm_as(void)
           "destroying empty address spaces returns their root pages");
 }
 
+static void selftest_vm_vma(void)
+{
+    kprintf("selftest: memory-mapped regions\n");
+
+    vm_as_t *as = vm_as_create();
+    CHECK(as != NULL, "address space for VMA tests");
+
+    /* Eager anonymous mapping. */
+    uint64_t va = vm_mmap(as, 0, 3 * PAGE_SIZE,
+                          VM_PROT_READ | VM_PROT_WRITE,
+                          VM_VMA_ANON | VM_MAP_POPULATE);
+    CHECK(va != 0 && page_aligned(va) && va >= VM_USER_BASE,
+          "anonymous mmap lands page-aligned above VM_USER_BASE");
+
+    unsigned level;
+    uint64_t *slot = vmm_pte_slot(vm_as_root(as), va, false, &level);
+    CHECK(slot != NULL && level == 1 && vmm_pte_present(*slot) &&
+          (vmm_pte_flags(*slot) & VM_PROT_WRITE),
+          "POPULATE maps the first page eagerly, read-write");
+    slot = vmm_pte_slot(vm_as_root(as), va + 2 * PAGE_SIZE, false, &level);
+    CHECK(slot != NULL && level == 1 && vmm_pte_present(*slot),
+          "POPULATE maps the whole range");
+    CHECK(vm_as_resident_pages(as) == 3,
+          "resident count is 3 after POPULATE");
+
+    /* Use it while it is the active address space. */
+    current->as = as;
+    vm_as_activate(as);
+    volatile uint64_t *p = (volatile uint64_t *)va;
+    p[0] = 0x1234;
+    p[(3 * PAGE_SIZE) / 8 - 1] = 0x5678;
+    CHECK(p[0] == 0x1234 && p[(3 * PAGE_SIZE) / 8 - 1] == 0x5678,
+          "read/write through the active address space");
+    current->as = NULL;
+    vm_as_activate(NULL);
+
+    /* Placement rules. */
+    CHECK(vm_mmap(as, va, PAGE_SIZE, VM_PROT_READ | VM_PROT_WRITE,
+                  VM_VMA_ANON | VM_MAP_FIXED) == 0,
+          "VM_MAP_FIXED over an existing region rejected");
+    CHECK(vm_mmap(as, 0, 0, VM_PROT_READ, VM_VMA_ANON) == 0,
+          "zero-length mmap rejected");
+    CHECK(vm_mmap(as, 0, PAGE_SIZE, VM_PROT_WRITE, VM_VMA_ANON) == 0,
+          "mmap without VM_PROT_READ rejected");
+
+    uint64_t va2 = vm_mmap(as, va + PAGE_SIZE, 2 * PAGE_SIZE,
+                           VM_PROT_READ | VM_PROT_WRITE, VM_VMA_ANON);
+    CHECK(va2 == va + 3 * PAGE_SIZE,
+          "colliding preferred hint moves to the next free gap");
+
+    /* Teardown. */
+    CHECK(vm_munmap(as, va + PAGE_SIZE, PAGE_SIZE),
+          "munmap of the middle page");
+    CHECK(vm_as_resident_pages(as) == 2,
+          "resident count drops to 2");
+    slot = vmm_pte_slot(vm_as_root(as), va + PAGE_SIZE, false, &level);
+    CHECK(slot == NULL || level != 1 || !vmm_pte_present(*slot),
+          "middle page PTE cleared by munmap");
+
+    uint64_t before = pmm_free_pages();
+    CHECK(vm_munmap(as, va, 2 * PAGE_SIZE),
+          "munmap of first page across a hole");
+    CHECK(pmm_free_pages() == before + 1,
+          "munmap returns exactly the one resident frame");
+
+    CHECK(vm_munmap(as, va2, 2 * PAGE_SIZE),
+          "munmap of the tail region (no resident pages there)");
+    CHECK(vm_as_resident_pages(as) == 1,
+          "one page remains resident in the kept remainder");
+    CHECK(vm_munmap(as, va + 2 * PAGE_SIZE, PAGE_SIZE),
+          "munmap of the kept remainder");
+    CHECK(vm_as_resident_pages(as) == 0, "all resident pages released");
+    CHECK(vm_munmap(as, va + 5 * PAGE_SIZE, PAGE_SIZE) == false,
+          "munmap of an untouched range reports nothing removed");
+
+    uint64_t vaf = vm_mmap(as, va, PAGE_SIZE, VM_PROT_READ | VM_PROT_WRITE,
+                           VM_VMA_ANON | VM_MAP_FIXED);
+    CHECK(vaf == va, "VM_MAP_FIXED at a free address is honored");
+    CHECK(vm_munmap(as, va, PAGE_SIZE), "final munmap");
+
+    vm_as_destroy(as);
+}
+
 static void kmain_cont(void)
 {
     vmm_init();
@@ -484,6 +567,7 @@ static void kmain_cont(void)
     selftest_timer();
     selftest_thread();
     selftest_vm_as();
+    selftest_vm_vma();
 
     kprintf("\nmemory management online — idling.\n");
 
