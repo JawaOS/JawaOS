@@ -4,9 +4,12 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+struct vm_as;
+
 typedef struct task {
     uint64_t sp;
     struct task *next;
+    struct vm_as *as;   /* process address space; NULL = kernel-only */
 } task_t;
 
 extern task_t *current;

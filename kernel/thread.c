@@ -2,7 +2,9 @@
 #include <stddef.h>
 
 #include "kheap.h"
+#include "spinlock.h"
 #include "thread.h"
+#include "vm.h"
 
 task_t *current;
 
@@ -167,6 +169,7 @@ void thread_init(void)
     static task_t main_task;
     main_task.next = &main_task;
     main_task.sp = 0;
+    main_task.as = NULL;
     current = &main_task;
     sched_active = true;
 }
@@ -181,18 +184,35 @@ void kthread_create(void (*fn)(uint64_t), uint64_t arg)
         top = (uint64_t *)kmalloc(STACK_WORDS * 8) + STACK_WORDS;
     }
     t->sp = make_frame(top, (uint64_t)fn, arg);
+    t->as = NULL;
+
+    /* Ring insertion must not interleave with a timer-driven switch. */
+    irqstate_t s = irq_save();
     t->next = current->next;
     current->next = t;
+    irq_restore(s);
 }
 
 void schedule(void)
 {
     if (!sched_active || !current || current->next == current)
         return;
+
+    /* The switch decision (ring walk, current, address space install)
+     * and switch_to itself must be atomic against the timer: a preemption
+     * in between would save the physically running stack into the wrong
+     * task's slot and turn tasks into zombies. Interrupt state travels
+     * with each task's own stack: whoever is switched to later restores
+     * the state it saved on its own stack. */
+    irqstate_t s = irq_save();
     task_t *prev = current;
     task_t *next = current->next;
     current = next;
+    /* Install the next task's address space before it runs. Kernel
+     * threads carry as == NULL and get the shared kernel root. */
+    vm_as_activate(next->as);
     switch_to(&prev->sp, next->sp);
+    irq_restore(s);
 }
 
 void yield(void)
@@ -203,13 +223,21 @@ void yield(void)
 __attribute__((noreturn))
 void thread_exit(void)
 {
+    /* Interrupts stay off across the final switch: this stack is
+     * abandoned and never resumes, so there is nothing to restore. */
+    irq_save();
     task_t *prev = current;
     while (prev->next != current)
         prev = prev->next;
     prev->next = current->next;
     task_t *next = current->next;
     current = next;
-    switch_to(&prev->sp, next->sp);
+    vm_as_activate(next->as);
+    /* The dying context must be saved into a scratch slot: saving it
+     * into a neighbour's slot (prev->sp) would clobber that task's
+     * saved state and turn whoever resumes it into a zombie. */
+    uint64_t zombie_sp;
+    switch_to(&zombie_sp, next->sp);
     for (;;)
         ;
 }

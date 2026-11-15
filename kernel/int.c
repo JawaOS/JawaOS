@@ -611,7 +611,10 @@ struct tf_rv {
     uint64_t sepc, sstatus, scause, stval;
 };
 
-__attribute__((naked, noinline, used))
+/* stvec ignores the low 2 bits; with the C extension enabled a misaligned
+ * vector entry decodes mid-instruction and control goes somewhere random.
+ * Keep the trap entry 4-byte aligned no matter how the text lays out. */
+__attribute__((naked, noinline, used, aligned(4)))
 static void trap_entry(void)
 {
     __asm__ volatile (

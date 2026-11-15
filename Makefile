@@ -40,7 +40,7 @@ endif
 OBJ := $(BUILD)/main.o $(BUILD)/console.o $(BUILD)/string.o $(BUILD)/serial.o \
        $(BUILD)/fbcon.o $(BUILD)/kprintf.o $(BUILD)/panic.o \
        $(BUILD)/boot.o $(BUILD)/spinlock.o $(BUILD)/pmm.o \
-       $(BUILD)/vmm.o $(BUILD)/kheap.o \
+       $(BUILD)/vmm.o $(BUILD)/kheap.o $(BUILD)/vm.o \
        $(BUILD)/int.o \
        $(BUILD)/timer.o $(BUILD)/thread.o
 

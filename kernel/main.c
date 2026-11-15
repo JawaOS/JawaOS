@@ -12,6 +12,7 @@
 #include "timer.h"
 #include "pmm.h"
 #include "string.h"
+#include "vm.h"
 #include "vmm.h"
 
 __attribute__((used, section(".limine_requests")))
@@ -412,6 +413,55 @@ static void selftest_int(void)
           "breakpoint exception delivered to handler and resumed");
 }
 
+static void selftest_vm_as(void)
+{
+    kprintf("selftest: per-process address spaces\n");
+
+    CHECK(vmm_user_va_limit() > PAGE_SIZE && vmm_user_levels() >= 2,
+          "arch layer exposes a user VA half with a multi-level walk");
+
+    vm_as_t *a = vm_as_create();
+    vm_as_t *b = vm_as_create();
+    CHECK(a != NULL && b != NULL, "vm_as_create succeeds");
+    CHECK(vm_as_root(a) != 0 && vm_as_root(b) != 0 &&
+          vm_as_root(a) != vm_as_root(b) &&
+          vm_as_root(a) != vmm_kernel_root(),
+          "each address space has a distinct root");
+
+    /* Run as process A: the shared higher half must keep working and
+     * the user half must be completely empty. */
+    current->as = a;
+    vm_as_activate(a);
+
+    volatile uint64_t canary = 0xA5A55A5Aull;
+    CHECK(canary == 0xA5A55A5Aull,
+          "kernel half executes normally under a user root");
+    CHECK(fault_probe(0x1000) == false,
+          "fresh address space has an empty user half (faults)");
+    CHECK(fault_probe((uint64_t)&canary) == true,
+          "kernel half stays mapped under a user root");
+
+    /* Switch to process B and back, the way the scheduler does. */
+    current->as = b;
+    vm_as_activate(b);
+    CHECK(canary == 0xA5A55A5Aull,
+          "second address space keeps the kernel half working");
+
+    current->as = NULL;
+    vm_as_activate(NULL);
+    CHECK(vm_as_current() == NULL,
+          "activate(NULL) restores the kernel root");
+
+    /* Heap growth from the two kmallocs is permanent (the kheap never
+     * returns pages), so measure after creation: destroying the two
+     * empty spaces must hand back exactly their two root pages. */
+    uint64_t before_destroy = pmm_free_pages();
+    vm_as_destroy(a);
+    vm_as_destroy(b);
+    CHECK(pmm_free_pages() == before_destroy + 2,
+          "destroying empty address spaces returns their root pages");
+}
+
 static void kmain_cont(void)
 {
     vmm_init();
@@ -419,6 +469,7 @@ static void kmain_cont(void)
     kheap_init();
     timer_init();
     thread_init();
+    vm_init();
 
     kprintf("\nJawaOS v0.4.0 (rungs 2-7: memory, exceptions, timers, threads)\n");
     kprintf("  arch:        %s\n", arch_name());
@@ -432,6 +483,7 @@ static void kmain_cont(void)
     selftest_int();
     selftest_timer();
     selftest_thread();
+    selftest_vm_as();
 
     kprintf("\nmemory management online — idling.\n");
 
