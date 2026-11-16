@@ -33,5 +33,9 @@ void panic(const char *fmt, ...)
 
     kprintf("\nCPU halted.\n");
 
+    /* Halting stops the scheduler, so nothing else will paint the
+     * deferred scroll flush — do it now, synchronously. */
+    fbcon_flush();
+
     halt_forever();
 }

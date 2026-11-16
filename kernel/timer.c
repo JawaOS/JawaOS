@@ -83,10 +83,13 @@ uint64_t ticks_ms(void)
 
 void msleep(uint64_t ms)
 {
-    /* No timer interrupt on this architecture yet: poll. */
+    /* No timer interrupt on this architecture yet: poll. The flush
+     * keeps a printing task's screen from staling while it sleeps. */
     uint64_t target = cntpct() + freq / 1000 * ms;
-    while (cntpct() < target)
+    while (cntpct() < target) {
+        fbcon_flush();
         __asm__ volatile ("yield");
+    }
 }
 
 #elif defined(__riscv)

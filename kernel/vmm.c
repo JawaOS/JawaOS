@@ -26,6 +26,7 @@ static uint64_t vmax(uint64_t a, uint64_t b) { return a > b ? a : b; }
 #define X86_RW    (1ull << 1)
 #define X86_US    (1ull << 2)
 #define X86_PCD   (1ull << 4)
+#define X86_PAT   (1ull << 7)  /* leaf PTEs only: index PCD=0,PWT=0,PAT=1 */
 
 #define X86_A     (1ull << 5)
 #define X86_D     (1ull << 6)
@@ -72,6 +73,8 @@ static uint64_t pte_leaf(uint64_t pa, unsigned flags)
         e |= X86_US;
     if (flags & VM_PROT_DEVICE)
         e |= X86_PCD;
+    if (flags & VM_PROT_FB)
+        e |= X86_PAT;       /* PAT entry 4 programmed to WC at boot */
     if (!(flags & VM_PROT_EXEC))
         e |= X86_NX;
     return e;
@@ -101,6 +104,22 @@ static unsigned pte_flags(uint64_t e)
     if (e & X86_US) f |= VM_PROT_USER;
     if (e & X86_PCD) f |= VM_PROT_DEVICE;
     return f;
+}
+
+/* Program PAT entry 4 to write-combining: leaf PTEs with PCD=0,PWT=0,
+ * PAT=1 index into it (VM_PROT_FB). Entry 4 is unused by the firmware's
+ * default PAT (WB,WT,UC-,UC,WB,WT,UC-,UC), so nothing else changes. */
+static void pat_init_wc(void)
+{
+    uint32_t lo, hi;
+
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0x277));
+    uint64_t pat = ((uint64_t)hi << 32) | lo;
+
+    pat = (pat & ~(0xFFull << 32)) | (0x01ull << 32);   /* entry 4: WC */
+    lo = (uint32_t)pat;
+    hi = (uint32_t)(pat >> 32);
+    __asm__ volatile ("wrmsr" : : "a"(lo), "d"(hi), "c"(0x277));
 }
 
 static void arch_install_root(uint64_t root_pa)
@@ -193,7 +212,8 @@ static uint64_t pte_leaf(uint64_t pa, unsigned flags)
 {
 
     uint64_t e = AA_TYPE_TABLE | AA_AF | AA_SH_IS
-               | AA_ATTRIDX((flags & VM_PROT_DEVICE) ? 1 : 0)
+               | AA_ATTRIDX((flags & VM_PROT_DEVICE) ? 1
+                            : (flags & VM_PROT_FB) ? 2 : 0)
                | (pa & PTE_PHYS_MASK);
 
     if (!(flags & VM_PROT_WRITE))
@@ -233,7 +253,9 @@ static unsigned pte_flags(uint64_t e)
 static void arch_install_root(uint64_t root_pa)
 {
 
-    const uint64_t mair = (0x04ull << 8) | 0xFFull;
+    /* idx 0: Normal WB/RW, idx 1: Device-nGnRnE, idx 2: Normal-NC (WC)
+     * for write-combined framebuffer mappings */
+    const uint64_t mair = (0x44ull << 16) | (0x04ull << 8) | 0xFFull;
 
     __asm__ volatile (
         "msr mair_el1, %0\n"
@@ -780,6 +802,37 @@ void *vmm_map_device(uint64_t phys, uint64_t size)
     return (void *)va;
 }
 
+/* Framebuffers live in device VRAM that is plain RAM underneath (QEMU
+ * VGA, real PCI BARs): they want DEVICE's uncached-read behaviour but
+ * not its store-by-store cost. WC combines stores into bursts while
+ * keeping reads uncached. */
+void *vmm_map_fb(uint64_t phys, uint64_t size)
+{
+    if (size == 0)
+        return NULL;
+    if (!page_aligned(phys))
+        panic("vmm: vmm_map_fb of unaligned physical 0x%llx",
+              (unsigned long long)phys);
+    if (vmm_root == NULL)
+        panic("vmm: vmm_map_fb before vmm_init()");
+
+    uint64_t npages = page_align_up(size) >> PAGE_SHIFT;
+
+    spin_lock(&device_lock);
+    if (device_next + npages * PAGE_SIZE >
+        VMM_DEVICE_BASE + VMM_DEVICE_SIZE)
+        panic("vmm: device window exhausted");
+    uint64_t va = device_next;
+    device_next += npages * PAGE_SIZE;
+    spin_unlock(&device_lock);
+
+    for (uint64_t i = 0; i < npages; i++)
+        vm_map(va + i * PAGE_SIZE, phys + i * PAGE_SIZE,
+               VM_PROT_READ | VM_PROT_WRITE | VM_PROT_FB);
+
+    return (void *)va;
+}
+
 static bool ranges_overlap(uint64_t a1, uint64_t a2, uint64_t b1, uint64_t b2)
 {
     return a1 < b2 && b1 < a2;
@@ -797,6 +850,9 @@ void vmm_init(void)
 
 #if defined(__aarch64__)
     a64_user_tcr_setup();
+#endif
+#if defined(__x86_64__)
+    pat_init_wc();
 #endif
 
     vmm_root_pa = arch_root_alloc();

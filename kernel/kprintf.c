@@ -5,6 +5,24 @@
 
 #include "console.h"
 
+/* kprintf buffers its formatted output and hands it to console_write()
+ * in chunks, holding the console lock across the whole call. The old
+ * path pushed every character through the console individually: one
+ * lock round trip, one UART write (polled) and one glyph draw per
+ * character — output pace was bound to the slowest of the three. */
+
+static char obuf[512];
+static unsigned olen;
+
+static void emit(char c)
+{
+    obuf[olen++] = c;
+    if (olen == sizeof(obuf)) {
+        console_write(obuf, olen);
+        olen = 0;
+    }
+}
+
 static int emit_num(unsigned long long v, unsigned base, int uppercase,
                     int zero_pad, int width, int negative)
 {
@@ -25,12 +43,12 @@ static int emit_num(unsigned long long v, unsigned base, int uppercase,
 
     int pad = width - n - (negative ? 1 : 0);
     if (!zero_pad)
-        while (pad-- > 0) { console_putchar(' '); count++; }
-    if (negative) { console_putchar('-'); count++; }
+        while (pad-- > 0) { emit(' '); count++; }
+    if (negative) { emit('-'); count++; }
     if (zero_pad)
-        while (pad-- > 0) { console_putchar('0'); count++; }
+        while (pad-- > 0) { emit('0'); count++; }
     while (n > 0) {
-        console_putchar(buf[--n]);
+        emit(buf[--n]);
         count++;
     }
     return count;
@@ -43,9 +61,11 @@ int kvprintf(const char *fmt, va_list ap)
     int count = 0;
     const char *p = fmt;
 
+    console_lock_begin();
+
     while (*p != '\0') {
         if (*p != '%') {
-            console_putchar(*p++);
+            emit(*p++);
             count++;
             continue;
         }
@@ -53,7 +73,7 @@ int kvprintf(const char *fmt, va_list ap)
         p++;
 
         if (*p == '%') {
-            console_putchar(*p++);
+            emit(*p++);
             count++;
             continue;
         }
@@ -84,7 +104,7 @@ int kvprintf(const char *fmt, va_list ap)
 
         case 'c': {
             char c = (char)va_arg(ap, int);
-            console_putchar(c);
+            emit(c);
             count++;
             break;
         }
@@ -97,11 +117,11 @@ int kvprintf(const char *fmt, va_list ap)
             while (s[n] != '\0')
                 n++;
             for (int pad = width - n; pad > 0; pad--) {
-                console_putchar(' ');
+                emit(' ');
                 count++;
             }
             for (int i = 0; i < n; i++) {
-                console_putchar(s[i]);
+                emit(s[i]);
                 count++;
             }
             break;
@@ -147,19 +167,19 @@ int kvprintf(const char *fmt, va_list ap)
 
         case 'p': {
             uintptr_t ptr = (uintptr_t)va_arg(ap, void *);
-            console_putchar('0');
-            console_putchar('x');
+            emit('0');
+            emit('x');
             count += 2;
             count += emit_num(ptr, 16, 0, 1, 2 * (int)sizeof(uintptr_t), 0);
             break;
         }
 
         case '\0':
-            return count;
+            goto out;
 
         default:
-            console_putchar('%');
-            console_putchar(*p);
+            emit('%');
+            emit(*p);
             count += 2;
             break;
         }
@@ -168,6 +188,13 @@ int kvprintf(const char *fmt, va_list ap)
             p++;
     }
 
+out:
+    if (olen != 0) {
+        console_write(obuf, olen);
+        olen = 0;
+    }
+
+    console_lock_end();
     return count;
 }
 

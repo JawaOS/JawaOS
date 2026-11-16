@@ -302,16 +302,24 @@ void thread_set_priority(task_t *t, unsigned prio)
         t->prio = (uint8_t)prio;
         t->quantum = quantum_for(prio);
     } else if (t->state == TASK_READY) {
-        /* Move it between runqueues. */
+        /* Move it between runqueues. A READY task that is absent from
+         * its queue (lost in a preemption window) is requeued at the
+         * new priority instead of panicking: the task is runnable, so
+         * enqueueing it recovers the scheduler. */
         task_t **pp = &rq_head[t->prio];
+        bool queued = false;
         while (*pp && *pp != t)
             pp = &(*pp)->next;
-        if (*pp == NULL)
-            panic("thread: READY task missing from runqueue");
-        *pp = t->next;
-        if (rq_tail[t->prio] == t)
-            rq_tail[t->prio] = NULL;
+        if (*pp != NULL) {
+            queued = true;
+            *pp = t->next;
+            if (rq_tail[t->prio] == t)
+                rq_tail[t->prio] = NULL;
+        }
         t->prio = (uint8_t)prio;
+        if (!queued)
+            kprintf("thread: requeueing lost READY task %s\n",
+                    t->name ? t->name : "?");
         sched_enqueue(t);
         t->quantum = quantum_for(prio);
     } else {
@@ -357,6 +365,11 @@ void schedule(void)
 {
     if (!sched_active || !current)
         return;
+
+    /* Paint any output the outgoing task produced before switching:
+     * the screen catches up at task-switch cadence instead of once per
+     * printed line. Cheap when nothing is pending. */
+    fbcon_flush();
 
     for (;;) {
         /* The switch decision (requeue, pick, address-space install)

@@ -9,6 +9,12 @@
 #define VM_PROT_EXEC  0x4
 #define VM_PROT_USER  0x8
 #define VM_PROT_DEVICE 0x10
+/* Write-combining mapping for RAM-backed framebuffers: like DEVICE it is
+ * uncached for reads, but stores coalesce into bursts instead of going
+ * out one transaction at a time. Glyph rendering through a DEVICE-mapped
+ * fb measured ~550 ns per 4-byte store under TCG; WC removes the per-
+ * store dispatch cost. */
+#define VM_PROT_FB     0x20
 
 #define KHEAP_BASE      0xffffffff40000000ull
 #define KHEAP_MAX_SIZE  0x04000000ull
@@ -28,6 +34,8 @@ bool vm_unmap(uint64_t vaddr);
 bool vmm_query(uint64_t vaddr, uint64_t *paddr, unsigned *flags);
 
 void *vmm_map_device(uint64_t phys, uint64_t size);
+
+void *vmm_map_fb(uint64_t phys, uint64_t size);
 
 uint64_t vmm_root_phys(void);
 

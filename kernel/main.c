@@ -833,6 +833,7 @@ static void kmain_cont(void)
     selftest_int();
     selftest_timer();
     selftest_thread();
+    selftest_sched();
     selftest_vm_as();
     selftest_vm_vma();
     selftest_vm_demand();
@@ -842,6 +843,7 @@ static void kmain_cont(void)
     kprintf("\nmemory management online — idling.\n");
 
     for (;;) {
+        fbcon_flush();
         cpu_idle();
     }
 }

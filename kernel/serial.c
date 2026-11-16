@@ -6,6 +6,14 @@
 #include "pmm.h"
 #include "vmm.h"
 
+/* Output is paced by the UART TX FIFO (16 entries on the 16550 and the
+ * PL011): poll the ready bit once per FIFO depth instead of once per
+ * byte. The old per-byte polling put every byte through an uncached
+ * I/O / device round trip and made the serial port the console's
+ * throttle — a 72-character line cost ~150 register polls. */
+
+#define TX_FIFO_DEPTH 16
+
 #if defined(__x86_64__)
 
 #define COM1 0x3f8
@@ -22,10 +30,14 @@ static inline uint8_t inb(uint16_t port)
     return val;
 }
 
-static void serial_putc_raw(char c)
+static void wait_tx_ready(void)
 {
     while (!(inb(COM1 + 5) & 0x20))
         ;
+}
+
+static void tx_write(char c)
+{
     outb(COM1, (uint8_t)c);
 }
 
@@ -52,10 +64,14 @@ static bool serial_port_ready(void)
 
 static volatile uint32_t *pl011;
 
-static void serial_putc_raw(char c)
+static void wait_tx_ready(void)
 {
     while (pl011[0x18 / 4] & (1u << 5))
         ;
+}
+
+static void tx_write(char c)
+{
     pl011[0x00 / 4] = (uint32_t)(uint8_t)c;
 }
 
@@ -82,10 +98,14 @@ static bool serial_port_ready(void)
 
 static volatile uint8_t *uart;
 
-static void serial_putc_raw(char c)
+static void wait_tx_ready(void)
 {
     while (!(uart[5] & 0x20))
         ;
+}
+
+static void tx_write(char c)
+{
     uart[0] = (uint8_t)c;
 }
 
@@ -111,16 +131,40 @@ static bool serial_port_ready(void)
 #error "unsupported architecture for serial console"
 #endif
 
+/* bytes pushed into the FIFO since the last ready-poll; persists across
+ * calls so pacing stays correct for byte-at-a-time callers too */
+static unsigned tx_pending;
+
+static void tx_byte(char c)
+{
+    if (tx_pending >= TX_FIFO_DEPTH) {
+        wait_tx_ready();
+        tx_pending = 0;
+    }
+    tx_write(c);
+    tx_pending++;
+}
+
 void serial_init(void)
 {
     serial_port_init();
 }
 
-void serial_putchar(char c)
+void serial_write(const char *buf, unsigned long n)
 {
     if (!serial_port_ready())
         return;
-    if (c == '\n')
-        serial_putc_raw('\r');
-    serial_putc_raw(c);
+
+    for (unsigned long i = 0; i < n; i++) {
+        char c = buf[i];
+
+        if (c == '\n')
+            tx_byte('\r');
+        tx_byte(c);
+    }
+}
+
+void serial_putchar(char c)
+{
+    serial_write(&c, 1);
 }
