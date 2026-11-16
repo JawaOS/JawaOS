@@ -280,6 +280,7 @@ static void wake_task(task_t *t)
     sched_enqueue(t);
 }
 
+__attribute__((unused))     /* unused on x86_64: its sleeps park for real */
 static void cpu_relax_hint(void)
 {
 #if defined(__x86_64__)

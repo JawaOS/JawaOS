@@ -1,18 +1,32 @@
 #include <stdint.h>
+#include <stddef.h>
 
 #include <limine.h>
 
 #include "boot.h"
 #include "console.h"
 #include "font.h"
+#include "kheap.h"
 #include "string.h"
 #include "vmm.h"
 
 #define GLYPH_W 8
 #define GLYPH_H 8
 
+/* The framebuffer is mapped uncached/device on every architecture, so
+ * READING it back is extremely slow — the original scroll() memmoved
+ * the fb onto itself (megabytes of uncached reads per newline) while
+ * the display engine scanned the same region, which showed up as
+ * tearing: text visibly "cut off" mid-scroll.
+ *
+ * This console therefore never reads the framebuffer. A shadow grid of
+ * characters lives in cached kernel memory; every mutation goes to the
+ * grid first and the framebuffer is only ever written. Scrolling moves
+ * the grid and redraws the screen from it (write-only blit). */
+
 struct fbcon_state {
     uint8_t *fb;
+    uint8_t *grid;              /* shadow text grid, cols * rows chars */
     uint64_t width;
     uint64_t height;
     uint64_t pitch;
@@ -48,12 +62,42 @@ static uint64_t pack_rgb(uint8_t r, uint8_t g, uint8_t b)
     return pixel;
 }
 
+/* Memory barriers so the display engine observes our writes in order:
+ * x86_64 UC stores are already strongly ordered; device memory on
+ * aarch64 and riscv64 needs an explicit barrier once per batch. */
+static void fb_barrier(void)
+{
+#if defined(__aarch64__)
+    __asm__ volatile ("dsb st" ::: "memory");
+#elif defined(__riscv)
+    __asm__ volatile ("fence ow, ow" ::: "memory");
+#else
+    __asm__ volatile ("" : : : "memory");
+#endif
+}
+
+static inline void fb_write(uint8_t *p, uint64_t pixel)
+{
+    switch (st.bytes_pp) {
+    case 4:
+        *(volatile uint32_t *)p = (uint32_t)pixel;
+        break;
+    case 2:
+        *(volatile uint16_t *)p = (uint16_t)pixel;
+        break;
+    case 1:
+        *(volatile uint8_t *)p = (uint8_t)pixel;
+        break;
+    default:                    /* 3 bytes-per-pixel and exotic depths */
+        for (uint32_t i = 0; i < st.bytes_pp; i++)
+            p[i] = (uint8_t)(pixel >> (8 * i));
+        break;
+    }
+}
+
 static void put_pixel(uint64_t x, uint64_t y, uint64_t pixel)
 {
-    uint8_t *p = st.fb + y * st.pitch + x * st.bytes_pp;
-
-    for (uint32_t i = 0; i < st.bytes_pp; i++)
-        p[i] = (uint8_t)(pixel >> (8 * i));
+    fb_write(st.fb + y * st.pitch + x * st.bytes_pp, pixel);
 }
 
 static void draw_glyph(char c, int gx, int gy)
@@ -70,24 +114,23 @@ static void draw_glyph(char c, int gx, int gy)
     }
 }
 
-static void clear_rows(int from_row, int to_row)
+/* Blit the shadow grid (or a part of it) to the framebuffer. Write-only
+ * against the fb; all state comes from cached memory. */
+static void redraw_rows(int from_row, int to_row)
 {
-    for (int r = from_row; r < to_row; r++)
-        for (int y = 0; y < GLYPH_H; y++) {
-            uint64_t py = (uint64_t)r * GLYPH_H + (uint64_t)y;
-            uint8_t *p = st.fb + py * st.pitch;
-            for (uint64_t x = 0; x < st.width * st.bytes_pp; x++)
-                p[x] = 0;
-        }
+    for (int r = from_row; r < to_row; r++) {
+        uint8_t *gline = st.grid + (uint64_t)r * st.cols;
+        for (int c = 0; c < st.cols; c++)
+            draw_glyph((char)gline[c], c, r);
+    }
+    fb_barrier();
 }
 
 static void scroll(void)
 {
-
-    memmove(st.fb,
-            st.fb + (uint64_t)GLYPH_H * st.pitch,
-            (st.height - (uint64_t)GLYPH_H) * st.pitch);
-    clear_rows(st.rows - 1, st.rows);
+    memmove(st.grid, st.grid + st.cols, (uint64_t)(st.rows - 1) * st.cols);
+    memset(st.grid + (uint64_t)(st.rows - 1) * st.cols, 0, st.cols);
+    redraw_rows(0, st.rows);
 }
 
 static void newline(void)
@@ -105,6 +148,7 @@ static void fbcon_putc(char c)
 
     if (u > 127)
         u = '?';
+    st.grid[(uint64_t)st.row * st.cols + st.col] = u;
     draw_glyph((char)u, st.col, st.row);
     if (++st.col >= st.cols)
         newline();
@@ -161,7 +205,15 @@ void fbcon_init(void)
     st.rows = (int)(st.height / GLYPH_H);
     st.col = 0;
     st.row = 0;
-    st.enabled = 1;
 
-    clear_rows(0, st.rows);
+    st.grid = kmalloc((uint64_t)st.cols * st.rows);
+    if (st.grid == NULL) {
+        /* No shadow grid: keep serial-only output rather than touch a
+         * framebuffer we cannot scroll safely. */
+        return;
+    }
+    memset(st.grid, 0, (uint64_t)st.cols * st.rows);
+
+    st.enabled = 1;
+    redraw_rows(0, st.rows);
 }
