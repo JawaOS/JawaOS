@@ -49,6 +49,12 @@ uint64_t vm_mmap(vm_as_t *as, uint64_t hint, uint64_t len,
  * range are fine; returns false if nothing overlapped. */
 bool vm_munmap(vm_as_t *as, uint64_t addr, uint64_t len);
 
+/* Clone an address space: same VMAs, same data — writable pages become
+ * shared copy-on-write (refcounted frames, downgraded to read-only in
+ * both spaces), read-only pages are shared as-is. Returns NULL on
+ * failure (the source is left functional). */
+vm_as_t *vm_as_clone(vm_as_t *src);
+
 /* Number of resident (mapped) pages owned by the address space. */
 uint64_t vm_as_resident_pages(vm_as_t *as);
 
@@ -75,5 +81,7 @@ void vm_fault_record(uint64_t va, bool write, bool exec);
  * fault is not recoverable: no VMA, permission violation, guard page,
  * already-resident mapping, or out of memory. */
 bool vm_handle_fault(uint64_t va, bool write, bool exec);
+
+extern uint64_t vm_cow_copies;  /* COW copy count (tests/diagnostics) */
 
 #endif

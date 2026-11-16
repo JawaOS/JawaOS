@@ -292,6 +292,14 @@ void int_init(void)
 
     __asm__ volatile ("lidt %0" :: "m"(idtr));
     __asm__ volatile ("ltr %w0" :: "rm"((uint16_t)0x18));
+
+    /* Copy-on-write depends on supervisor stores honouring the PTE
+     * read-only bit: Limine's boot leaves CR0.WP clear, which lets ring-0
+     * writes silently bypass read-only pages. Turn write protection on. */
+    uint64_t cr0;
+    __asm__ volatile ("movq %%cr0, %0" : "=r"(cr0));
+    cr0 |= (1ull << 16);                    /* CR0.WP */
+    __asm__ volatile ("movq %0, %%cr0" : : "r"(cr0) : "memory");
 }
 
 void int_dump_frame(const void *frame)
@@ -536,16 +544,20 @@ static void exc_dispatch(struct tf_a64 *tf)
             tf->meta[2] = elr + 4;   /* BRK: ELR points AT the instruction;
                                         SVC: ELR already points past it */
     } else if (abort_ec) {
-        /* Aborts: record, then try demand-page recovery. Data aborts
-         * carry WnR in ESR bit 6; EC 0x20/0x21 are instruction aborts. */
+        /* Aborts: record, then either resume an armed probe or try
+         * demand-page recovery. Data aborts carry WnR in ESR bit 6;
+         * EC 0x20/0x21 are instruction aborts. */
         bool write = (ec == 0x24 || ec == 0x25) && (esr & (1 << 6)) != 0;
         bool exec = ec == 0x20 || ec == 0x21;
         vm_fault_record(far, write, exec);
-        if (!probe_armed && vm_handle_fault(far, write, exec))
+        if (probe_armed) {
+            tf->x0 = 1;
+            tf->meta[2] = (uint64_t)probe_fail_leaf;
+        } else if (vm_handle_fault(far, write, exec)) {
             return;     /* recovered: ELR already retries the instruction */
-    } else if (probe_armed && abort_ec) {
-        tf->x0 = 1;
-        tf->meta[2] = (uint64_t)probe_fail_leaf;
+        } else {
+            int_panic_dump(tf, ec, esr, far);
+        }
     } else {
         int_panic_dump(tf, ec, esr, far);
     }

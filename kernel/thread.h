@@ -15,7 +15,7 @@ typedef struct task {
 extern task_t *current;
 
 void thread_init(void);
-void kthread_create(void (*fn)(uint64_t), uint64_t arg);
+task_t *kthread_create(void (*fn)(uint64_t), uint64_t arg);
 void yield(void);
 void schedule(void);
 void thread_exit(void) __attribute__((noreturn));

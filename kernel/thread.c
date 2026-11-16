@@ -174,7 +174,7 @@ void thread_init(void)
     sched_active = true;
 }
 
-void kthread_create(void (*fn)(uint64_t), uint64_t arg)
+task_t *kthread_create(void (*fn)(uint64_t), uint64_t arg)
 {
     task_t *t = kmalloc(sizeof *t);
     uint64_t *top;
@@ -191,6 +191,8 @@ void kthread_create(void (*fn)(uint64_t), uint64_t arg)
     t->next = current->next;
     current->next = t;
     irq_restore(s);
+
+    return t;
 }
 
 void schedule(void)

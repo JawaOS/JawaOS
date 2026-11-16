@@ -1,6 +1,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#include <limine.h>
+
 #include "boot.h"
 #include "console.h"
 #include "kheap.h"
@@ -29,6 +31,87 @@ struct vm_as {
  * variable once SMP bring-up lands; the shootdown layer is built around
  * that model already. */
 static vm_as_t *active_as;
+
+/* ---- shared-frame refcounts (copy-on-write) ----
+ *
+ * xv6-cow-lab style: a direct table indexed by PFN, sized from the boot
+ * memory map. Entry 0 means "untracked" — frames that were never shared
+ * (kheap pages, page tables, plain user frames) are freed directly by
+ * their owners; once a clone shares a frame it becomes tracked.
+ * The clone registers the first sharing as 2 (parent + child). */
+#define VM_VMA_COW 0x1000u      /* region downgraded at clone time */
+
+static uint32_t *frame_refs;
+static uint64_t frame_refs_max;
+static spinlock_t frame_refs_lock = SPINLOCK_INIT;
+
+static void frame_refs_init(void)
+{
+    if (frame_refs != NULL)
+        return;
+
+    /* The PMM only ever hands out USABLE frames, so size the table by
+     * the top of the highest USABLE region — not the whole physical
+     * address space (reserved MMIO windows can reach into the 64-bit
+     * range and would make this table absurdly large). */
+    uint64_t max_phys = 0;
+    for (uint64_t i = 0; i < bootinfo.memmap_count; i++) {
+        const struct boot_memmap_entry *e = &bootinfo.memmap[i];
+        if (e->type != LIMINE_MEMMAP_USABLE)
+            continue;
+        uint64_t top = page_align_up(e->base + e->length);
+        if (top > max_phys)
+            max_phys = top;
+    }
+    frame_refs_max = max_phys >> PAGE_SHIFT;
+
+    frame_refs = kmalloc((frame_refs_max + 1) * sizeof(uint32_t));
+    if (frame_refs == NULL)
+        panic("vm: cannot allocate frame refcount table");
+    memset(frame_refs, 0, (frame_refs_max + 1) * sizeof(uint32_t));
+}
+
+static uint32_t cow_refs(uint64_t pa)
+{
+    uint64_t pfn = pa >> PAGE_SHIFT;
+    return pfn <= frame_refs_max ? frame_refs[pfn] : 0;
+}
+
+static void cow_ref_inc(uint64_t pa)
+{
+    uint64_t pfn = pa >> PAGE_SHIFT;
+    if (pfn > frame_refs_max)
+        panic("vm: COW refcount for out-of-range frame 0x%llx",
+              (unsigned long long)pa);
+
+    spin_lock(&frame_refs_lock);
+    frame_refs[pfn] = frame_refs[pfn] == 0 ? 2 : frame_refs[pfn] + 1;
+    spin_unlock(&frame_refs_lock);
+}
+
+/* Returns true when the last reference disappeared and the frame was
+ * released to the PMM. */
+static bool cow_ref_dec(uint64_t pa)
+{
+    uint64_t pfn = pa >> PAGE_SHIFT;
+    if (pfn > frame_refs_max)
+        panic("vm: COW refcount for out-of-range frame 0x%llx",
+              (unsigned long long)pa);
+
+    spin_lock(&frame_refs_lock);
+    if (frame_refs[pfn] == 0) {
+        spin_unlock(&frame_refs_lock);
+        panic("vm: COW refcount underflow on frame 0x%llx",
+              (unsigned long long)pa);
+    }
+    frame_refs[pfn]--;
+    bool gone = frame_refs[pfn] == 0;
+    spin_unlock(&frame_refs_lock);
+
+    if (gone)
+        pmm_free(pa);
+    return gone;
+}
 
 /* aarch64: all-zero root installed whenever no user AS is active, so
  * every access to the low VA half deterministically faults. */
@@ -152,7 +235,8 @@ static uint64_t vm_map_page(struct vm_as *as, uint64_t va, unsigned flags)
     return frame;
 }
 
-/* Unmap one page from any root; frees the frame if it was resident. */
+/* Unmap one page from any root; frees the frame if it was resident.
+ * Shared (COW-tracked) frames are released through the refcount. */
 static bool vm_unmap_page(struct vm_as *as, uint64_t va)
 {
     unsigned level;
@@ -160,7 +244,11 @@ static bool vm_unmap_page(struct vm_as *as, uint64_t va)
     if (slot == NULL || level != 1 || !vmm_pte_present(*slot))
         return false;
 
-    pmm_free(vmm_pte_paddr(*slot));
+    uint64_t pa = vmm_pte_paddr(*slot);
+    if (cow_refs(pa) > 0)
+        cow_ref_dec(pa);
+    else
+        pmm_free(pa);
     as->resident_pages--;
     vmm_pte_clear(slot);
 
@@ -362,6 +450,8 @@ static void arch_set_root(uint64_t root_pa)
 
 struct vm_fault_info vm_last_fault;
 
+uint64_t vm_cow_copies;     /* diagnostics/tests: COW copies performed */
+
 static bool vma_access_ok(struct vm_vma *v, bool write, bool exec)
 {
     if (v->flags & VM_VMA_GUARD)
@@ -400,10 +490,48 @@ bool vm_handle_fault(uint64_t va, bool write, bool exec)
         return false;
     }
 
-    /* A resident page faulting again is a genuine permission violation,
-     * not something demand paging can fix. */
     unsigned level;
     uint64_t *slot = vmm_pte_slot(as->root_pa, va, false, &level, NULL);
+
+    /* Copy-on-write: the page is resident but was downgraded to
+     * read-only when the address space was cloned, and the VMA still
+     * grants write. */
+    if (write && slot != NULL && level == 1 && vmm_pte_present(*slot) &&
+        (v->flags & VM_VMA_COW) &&
+        !(vmm_pte_flags(*slot) & VM_PROT_WRITE)) {
+        uint64_t pa = vmm_pte_paddr(*slot);
+        uint32_t refs = cow_refs(pa);
+
+        if (refs <= 1) {
+            /* Sole owner: upgrade in place, no copy. */
+            if (refs == 1) {
+                spin_lock(&frame_refs_lock);
+                frame_refs[pa >> PAGE_SHIFT] = 0;
+                spin_unlock(&frame_refs_lock);
+            }
+            vmm_pte_write_leaf(slot, pa, v->flags);
+        } else {
+            /* Shared: private copy for the faulting space. */
+            uint64_t npa = pmm_alloc();
+            if (npa == 0) {
+                spin_unlock(&as->lock);
+                return false;           /* OOM: caller kills */
+            }
+            memcpy((void *)boot_phys_to_virt(npa),
+                   (void *)boot_phys_to_virt(pa), PAGE_SIZE);
+            vmm_pte_write_leaf(slot, npa, v->flags);
+            cow_ref_dec(pa);            /* drops to 1: parent sole owner */
+            vm_cow_copies++;
+        }
+
+        if (as == active_as)
+            vmm_tlb_inval(va);
+        spin_unlock(&as->lock);
+        return true;
+    }
+
+    /* A resident page faulting again is a genuine permission violation,
+     * not something demand paging can fix. */
     if (slot != NULL && level == 1 && vmm_pte_present(*slot)) {
         spin_unlock(&as->lock);
         return false;
@@ -434,6 +562,8 @@ void vm_as_activate(vm_as_t *as)
 
 void vm_init(void)
 {
+    frame_refs_init();
+
 #if defined(__aarch64__)
     a64_null_root = pmm_alloc();
     if (a64_null_root == 0)
@@ -495,4 +625,94 @@ void vm_as_destroy(vm_as_t *as)
     vmm_free_user_tables(as->root_pa);
 
     kfree(as);
+}
+
+vm_as_t *vm_as_clone(vm_as_t *src)
+{
+    if (src == NULL)
+        return NULL;
+    frame_refs_init();
+
+    vm_as_t *dst = vm_as_create();
+    if (dst == NULL)
+        return NULL;
+
+    spin_lock(&src->lock);
+    spin_lock(&dst->lock);
+
+    /* Copy the VMA list. */
+    struct vm_vma **tail = &dst->vmas;
+    for (struct vm_vma *v = src->vmas; v; v = v->next) {
+        struct vm_vma *nv = kmalloc(sizeof *nv);
+        if (nv == NULL)
+            goto oom;
+        nv->start = v->start;
+        nv->end = v->end;
+        nv->flags = v->flags;
+        nv->next = NULL;
+        *tail = nv;
+        tail = &nv->next;
+    }
+
+    /* Share resident pages: writable ones become COW in both spaces,
+     * read-only ones are shared as-is. */
+    struct vm_vma *dv = dst->vmas;
+    for (struct vm_vma *v = src->vmas; v; v = v->next, dv = dv->next) {
+        if (v->flags & VM_VMA_GUARD)
+            continue;
+
+        bool downgrade = (v->flags & VM_PROT_WRITE) != 0;
+        if (downgrade) {
+            dv->flags |= VM_VMA_COW;
+            v->flags |= VM_VMA_COW;     /* parent keeps the flag too */
+        }
+
+        for (uint64_t va = v->start; va < v->end; va += PAGE_SIZE) {
+            unsigned level;
+            uint64_t *sslot = vmm_pte_slot(src->root_pa, va, false,
+                                           &level, NULL);
+            if (sslot == NULL || level != 1 || !vmm_pte_present(*sslot))
+                continue;
+
+            uint64_t pa = vmm_pte_paddr(*sslot);
+            unsigned sflags = vmm_pte_flags(*sslot);
+            unsigned dflags = dv->flags;
+
+            if (downgrade) {
+                unsigned ro = dv->flags & ~(unsigned)VM_PROT_WRITE;
+                if (sflags & VM_PROT_WRITE) {
+                    /* Downgrade the parent in place. */
+                    vmm_pte_write_leaf(sslot, pa, ro);
+                    if (src == active_as)
+                        vmm_tlb_inval(va);
+                    cow_ref_inc(pa);
+                } else if (cow_refs(pa) > 0) {
+                    cow_ref_inc(pa);    /* already shared */
+                }
+                dflags = ro;
+            }
+
+            unsigned dcreated = 0;
+            unsigned dlevel;
+            uint64_t *dslot = vmm_pte_slot(dst->root_pa, va, true,
+                                           &dlevel, &dcreated);
+            dst->table_pages += dcreated;
+            if (dslot == NULL || dlevel != 1)
+                goto oom;
+            vmm_pte_write_leaf(dslot, pa, dflags);
+            dst->resident_pages++;
+        }
+    }
+
+    spin_unlock(&dst->lock);
+    spin_unlock(&src->lock);
+    return dst;
+
+oom:
+    spin_unlock(&dst->lock);
+    spin_unlock(&src->lock);
+    /* The parent may have been downgraded; that is safe — pages with
+     * refcount >= 1 upgrade in place again on the next write fault. */
+    vm_as_destroy(dst);
+    return NULL;
 }

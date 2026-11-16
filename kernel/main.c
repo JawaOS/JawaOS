@@ -8,6 +8,7 @@
 #include "console.h"
 #include "int.h"
 #include "kheap.h"
+#include "spinlock.h"
 #include "thread.h"
 #include "timer.h"
 #include "pmm.h"
@@ -597,6 +598,110 @@ static void selftest_vm_demand(void)
     vm_as_destroy(as);
 }
 
+/* ---- COW clone test: child thread writes through its own AS ---- */
+
+static vm_as_t *cow_parent_as, *cow_child_as;
+static volatile uint64_t cow_child_done;
+static volatile uint64_t cow_test_va;
+static volatile uint64_t cow_shared_read_a, cow_shared_read_b;
+
+static void cow_child_task(uint64_t arg)
+{
+    (void)arg;
+    volatile uint64_t *p = (volatile uint64_t *)cow_test_va;
+
+    /* Reads walk the shared COW mappings. */
+    cow_shared_read_a = p[0];
+    cow_shared_read_b = p[PAGE_SIZE / 8];
+
+    /* Writes to two DIFFERENT pages trigger two copy-on-write faults. */
+    p[0] = 0x1111111111111111ull;
+    p[PAGE_SIZE / 8] = 0x2222222222222222ull;
+
+    cow_child_done = 1;
+    thread_exit();
+}
+
+static void selftest_vm_cow(void)
+{
+    kprintf("selftest: address-space cloning and copy-on-write\n");
+
+    cow_parent_as = vm_as_create();
+    CHECK(cow_parent_as != NULL, "parent address space");
+
+    uint64_t va = vm_mmap(cow_parent_as, 0, 2 * PAGE_SIZE,
+                          VM_PROT_READ | VM_PROT_WRITE,
+                          VM_VMA_ANON | VM_MAP_POPULATE);
+    CHECK(va != 0, "parent RW region");
+    cow_test_va = va;
+
+    current->as = cow_parent_as;
+    vm_as_activate(cow_parent_as);
+    volatile uint64_t *p = (volatile uint64_t *)va;
+    p[0] = 0xCAFEF00DDEADBEEFull;
+    p[PAGE_SIZE / 8] = 0x0BADC0DE5A5A5A5Aull;   /* second page */
+
+    uint64_t before_clone = pmm_free_pages();
+    cow_child_as = vm_as_clone(cow_parent_as);
+    CHECK(cow_child_as != NULL, "vm_as_clone succeeds");
+    CHECK(pmm_free_pages() ==
+              before_clone - vm_as_table_pages(cow_child_as),
+          "clone cost is table pages only (no data frames)");
+
+    /* Both sides now hold the same frames, read-only. */
+    unsigned level;
+    uint64_t *pslot = vmm_pte_slot(vm_as_root(cow_parent_as), va, false,
+                                   &level, NULL);
+    uint64_t *cslot = vmm_pte_slot(vm_as_root(cow_child_as), va, false,
+                                   &level, NULL);
+    CHECK(pslot && cslot && level == 1 &&
+          vmm_pte_paddr(*pslot) == vmm_pte_paddr(*cslot),
+          "parent and child map the same frame");
+    CHECK(vmm_pte_paddr(*pslot) != 0 &&
+          !(vmm_pte_flags(*pslot) & VM_PROT_WRITE) &&
+          !(vmm_pte_flags(*cslot) & VM_PROT_WRITE),
+          "both mappings downgraded to read-only");
+
+    /* Child runs with its own address space and COW-copies on write.
+     * The AS must be attached before the task can ever run. The child
+     * may run entirely inside a timer preemption, so every check uses
+     * values that stay meaningful regardless of interleaving. */
+    irqstate_t s = irq_save();
+    task_t *child = kthread_create(cow_child_task, 0);
+    child->as = cow_child_as;
+    irq_restore(s);
+    CHECK(child != NULL, "child kthread");
+
+    while (!cow_child_done)
+        yield();
+
+    CHECK(cow_shared_read_a == 0xCAFEF00DDEADBEEFull &&
+          cow_shared_read_b == 0x0BADC0DE5A5A5A5Aull,
+          "child read the parent's data through shared mappings");
+    CHECK(vm_cow_copies == 2,
+          "child's two page writes COW-copied exactly two frames");
+
+    /* Parent is untouched by the child's writes... */
+    CHECK(p[0] == 0xCAFEF00DDEADBEEFull &&
+          p[PAGE_SIZE / 8] == 0x0BADC0DE5A5A5A5Aull,
+          "parent data unchanged after child's COW copies");
+
+    /* ...and its next write is an in-place upgrade (refcount 1). */
+    pslot = vmm_pte_slot(vm_as_root(cow_parent_as), va, false, &level, NULL);
+    uint64_t pa_before = vmm_pte_paddr(*pslot);
+    p[0] = 0x3333333333333333ull;
+    pslot = vmm_pte_slot(vm_as_root(cow_parent_as), va, false, &level, NULL);
+    CHECK(vmm_pte_paddr(*pslot) == pa_before &&
+          (vmm_pte_flags(*pslot) & VM_PROT_WRITE),
+          "sole-owner write upgrades in place (no copy)");
+    CHECK(p[0] == 0x3333333333333333ull, "parent sees its own write");
+
+    current->as = NULL;
+    vm_as_activate(NULL);
+    vm_as_destroy(cow_parent_as);
+    vm_as_destroy(cow_child_as);
+}
+
 static void kmain_cont(void)
 {
     vmm_init();
@@ -621,6 +726,7 @@ static void kmain_cont(void)
     selftest_vm_as();
     selftest_vm_vma();
     selftest_vm_demand();
+    selftest_vm_cow();
 
     kprintf("\nmemory management online — idling.\n");
 
