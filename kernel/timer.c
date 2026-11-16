@@ -43,7 +43,7 @@ void timer_tick(void)
 {
     mmw(&lapic->r[LAPIC_EOI], 0);
     ticks++;
-    schedule();
+    sched_tick();
 }
 
 uint64_t ticks_ms(void)
@@ -53,9 +53,7 @@ uint64_t ticks_ms(void)
 
 void msleep(uint64_t ms)
 {
-    uint64_t target = ticks + ms;
-    while (ticks < target)
-        __asm__ volatile ("hlt");
+    thread_sleep_ms(ms);
 }
 
 #elif defined(__aarch64__)
@@ -85,6 +83,7 @@ uint64_t ticks_ms(void)
 
 void msleep(uint64_t ms)
 {
+    /* No timer interrupt on this architecture yet: poll. */
     uint64_t target = cntpct() + freq / 1000 * ms;
     while (cntpct() < target)
         __asm__ volatile ("yield");
@@ -112,7 +111,7 @@ void timer_init(void)
 void timer_tick(void)
 {
     ticks++;
-    schedule();
+    sched_tick();
 }
 
 uint64_t ticks_ms(void)
@@ -122,9 +121,7 @@ uint64_t ticks_ms(void)
 
 void msleep(uint64_t ms)
 {
-    uint64_t target = rdtime() + interval * ms;
-    while (rdtime() < target)
-        __asm__ volatile ("addi x0, x0, 0");
+    thread_sleep_ms(ms);
 }
 
 #else

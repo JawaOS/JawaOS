@@ -742,6 +742,76 @@ static void selftest_vm_guard(void)
     vm_as_destroy(as);
 }
 
+/* ---- scheduler: priority wake order + deadline wakeups ---- */
+
+static wq_t sched_test_wq;
+static spinlock_t sched_wake_lk = SPINLOCK_INIT;
+static volatile uint64_t sched_parked;
+static volatile uint64_t sched_run_idx;
+static volatile uint64_t sched_first_run[3];
+static volatile uint64_t sched_timed_wake;
+
+static void sched_parked_task(uint64_t arg)
+{
+    /* Park immediately; the order the scheduler re-runs us after the
+     * wake is what the test measures. */
+    sched_parked++;
+    wq_block(&sched_test_wq, &sched_wake_lk);
+
+    sched_first_run[arg] = ++sched_run_idx;
+    thread_exit();
+}
+
+static void sched_timed_task(uint64_t arg)
+{
+    (void)arg;
+    thread_sleep_ms(60);
+    sched_timed_wake++;
+    thread_exit();
+}
+
+static void selftest_sched(void)
+{
+    kprintf("selftest: scheduler priorities and wakeups\n");
+
+    wq_init(&sched_test_wq);
+    sched_parked = 0;
+    sched_run_idx = 0;
+
+    /* Three parked tasks at distinct priorities: created hi/mid/lo.
+     * Each parks at first run; after wake_all, the scheduler must run
+     * them strictly by priority, regardless of parking order. */
+    task_t *t2 = kthread_create(sched_parked_task, 2);
+    task_t *t1 = kthread_create(sched_parked_task, 1);
+    task_t *t0 = kthread_create(sched_parked_task, 0);
+    CHECK(t0 != NULL && t1 != NULL && t2 != NULL,
+          "priority test tasks created");
+    thread_set_priority(t0, 0);
+    thread_set_priority(t1, 1);
+    thread_set_priority(t2, 2);
+
+    while (sched_parked < 3)
+        yield();
+    CHECK(sched_parked == 3, "all three tasks parked on the wait queue");
+
+    wq_wake_all(&sched_test_wq);
+    while (sched_run_idx < 3)
+        yield();
+
+    CHECK(sched_first_run[0] == 1 && sched_first_run[1] == 2 &&
+          sched_first_run[2] == 3,
+          "wake order follows priority (hi, mid, lo)");
+
+    /* Deadline wakeups with no explicit waker. */
+    sched_timed_wake = 0;
+    CHECK(kthread_create(sched_timed_task, 0) != NULL, "timed task created");
+    while (sched_timed_wake == 0)
+        yield();
+    CHECK(sched_timed_wake == 1, "deadline woke the sleeping task");
+
+    thread_reap();
+}
+
 static void kmain_cont(void)
 {
     vmm_init();
