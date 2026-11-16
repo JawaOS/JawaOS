@@ -55,6 +55,13 @@ bool vm_munmap(vm_as_t *as, uint64_t addr, uint64_t len);
  * failure (the source is left functional). */
 vm_as_t *vm_as_clone(vm_as_t *src);
 
+/* Allocate a guarded stack: [guard 4 KiB][npages RW][guard 4 KiB].
+ * hint is the address of the lower guard page (0: chosen first-fit).
+ * Returns the base of the usable stack area (the first RW page), or 0
+ * on failure. Any access to a guard page is an unrecoverable fault
+ * (vm_last_fault.guard is set when it happens). */
+uint64_t vm_alloc_stack(vm_as_t *as, uint64_t npages, uint64_t hint);
+
 /* Number of resident (mapped) pages owned by the address space. */
 uint64_t vm_as_resident_pages(vm_as_t *as);
 

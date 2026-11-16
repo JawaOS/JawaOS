@@ -702,6 +702,46 @@ static void selftest_vm_cow(void)
     vm_as_destroy(cow_child_as);
 }
 
+static void selftest_vm_guard(void)
+{
+    kprintf("selftest: guard pages\n");
+
+    vm_as_t *as = vm_as_create();
+    CHECK(as != NULL, "address space for guard test");
+
+    uint64_t st = vm_alloc_stack(as, 2, 0x3000000ull);
+    CHECK(st == 0x3000000ull + PAGE_SIZE,
+          "stack body placed right above the lower guard");
+
+    /* In-bounds pages work normally (demand-filled on first touch).
+     * The AS stays active: guard classification looks up the faulting
+     * address in the CURRENT address space. */
+    current->as = as;
+    vm_as_activate(as);
+    volatile uint64_t *p = (volatile uint64_t *)st;
+    p[0] = 42;
+    CHECK(p[0] == 42, "stack body is usable");
+    p[PAGE_SIZE / 8] = 43;
+    CHECK(p[PAGE_SIZE / 8] == 43, "second stack page is usable");
+
+    /* Guards reject any access, on both sides. */
+    CHECK(fault_probe(st - 1) == false, "lower guard page faults");
+    CHECK(vm_last_fault.valid && vm_last_fault.guard,
+          "lower guard fault classified as guard");
+    CHECK(fault_probe(st + 2 * PAGE_SIZE) == false,
+          "upper guard page faults");
+    CHECK(vm_last_fault.valid && vm_last_fault.guard,
+          "upper guard fault classified as guard");
+    current->as = NULL;
+    vm_as_activate(NULL);
+
+    /* Collision: a second stack overlapping the first is rejected. */
+    CHECK(vm_alloc_stack(as, 2, 0x3000000ull) == 0,
+          "overlapping stack allocation rejected");
+
+    vm_as_destroy(as);
+}
+
 static void kmain_cont(void)
 {
     vmm_init();
@@ -727,6 +767,7 @@ static void kmain_cont(void)
     selftest_vm_vma();
     selftest_vm_demand();
     selftest_vm_cow();
+    selftest_vm_guard();
 
     kprintf("\nmemory management online — idling.\n");
 

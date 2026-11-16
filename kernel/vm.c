@@ -386,6 +386,48 @@ bool vm_munmap(struct vm_as *as, uint64_t addr, uint64_t len)
     return removed_anything;
 }
 
+uint64_t vm_alloc_stack(vm_as_t *as, uint64_t npages, uint64_t hint)
+{
+    if (as == NULL || npages == 0)
+        return 0;
+    if (hint != 0 && !page_aligned(hint))
+        return 0;
+
+    uint64_t limit = vmm_user_va_limit();
+    if (hint != 0 &&
+        (hint < VM_USER_BASE ||
+         hint + (npages + 2) * PAGE_SIZE > limit))
+        return 0;
+    if (hint == 0) {
+        hint = vma_first_fit(as, VM_USER_BASE, (npages + 2) * PAGE_SIZE,
+                             limit);
+        if (hint == 0)
+            return 0;
+    }
+
+    /* Lower guard: registered but access-rejected by VM_VMA_GUARD no
+     * matter what permissions ride along. */
+    if (vm_mmap(as, hint, PAGE_SIZE, VM_PROT_READ,
+                VM_VMA_GUARD | VM_MAP_FIXED) == 0)
+        return 0;
+
+    uint64_t body = vm_mmap(as, hint + PAGE_SIZE, npages * PAGE_SIZE,
+                            VM_PROT_READ | VM_PROT_WRITE, VM_MAP_FIXED);
+    if (body == 0) {
+        vm_munmap(as, hint, PAGE_SIZE);
+        return 0;
+    }
+
+    if (vm_mmap(as, body + npages * PAGE_SIZE, PAGE_SIZE, VM_PROT_READ,
+                VM_VMA_GUARD | VM_MAP_FIXED) == 0) {
+        vm_munmap(as, body, npages * PAGE_SIZE);
+        vm_munmap(as, hint, PAGE_SIZE);
+        return 0;
+    }
+
+    return body;
+}
+
 #if defined(__x86_64__)
 
 static inline uint64_t arch_cur_root(void)
